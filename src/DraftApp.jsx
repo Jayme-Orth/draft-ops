@@ -25,9 +25,85 @@ const DEFAULT_SETTINGS = {
   scoringFormat: 'Full PPR',
   activeAdp: 'adp1',
   adpLabels: { adp1: 'ADP 1', adp2: 'ADP 2', adp3: 'ADP 3' },
+  activeRankings: 'rank1', // rank1, rank2, rank3, or aggregate
+  rankingLabels: { rank1: 'Rankings 1', rank2: 'Rankings 2', rank3: 'Rankings 3', aggregate: 'Aggregate' },
   roster: { QB: 1, RB: 2, WR: 3, TE: 1, FLEX: 1, K: 1, DST: 1, BENCH: 6 },
   thresholds: { steal: 12, value: 6, reach: 6 },
   weights: { rosterNeed: 2, scarcity: 2, run: 1 },
+};
+
+// ==================== NAME MATCHING ====================
+// Normalize player names for cross-source matching.
+// Handles: punctuation, common suffixes (Jr/Sr/II/III/IV), apostrophes, periods, case.
+const normalizeName = (name) => {
+  if (!name) return '';
+  return name
+    .toLowerCase()
+    .replace(/['']/g, '')           // remove apostrophes
+    .replace(/\./g, '')              // remove periods (A.J. → AJ)
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b\.?/g, '') // strip suffixes
+    .replace(/[^a-z0-9 ]/g, ' ')    // anything else not alphanumeric → space
+    .replace(/\s+/g, ' ')            // collapse whitespace
+    .trim();
+};
+
+// Levenshtein distance for fuzzy matching when exact normalized match fails
+const levenshtein = (a, b) => {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+};
+
+// Given a target name and a list of candidates, find the best match within tolerance.
+// Returns { match, score } or null.
+const findBestNameMatch = (target, candidates, pos = null) => {
+  if (!target) return null;
+  const normTarget = normalizeName(target);
+
+  // Step 1: exact normalized match
+  for (const c of candidates) {
+    if (pos && c.pos && c.pos !== pos) continue;
+    if (normalizeName(c.player) === normTarget) {
+      return { match: c, score: 1.0, exact: true };
+    }
+  }
+
+  // Step 2: fuzzy match — within distance/length threshold
+  let best = null;
+  let bestDist = Infinity;
+  for (const c of candidates) {
+    if (pos && c.pos && c.pos !== pos) continue;
+    const normCand = normalizeName(c.player);
+    const dist = levenshtein(normTarget, normCand);
+    // Threshold: distance must be <= 20% of the longer name length, and absolute <= 3
+    const maxLen = Math.max(normTarget.length, normCand.length);
+    if (dist < bestDist && dist <= Math.min(3, Math.floor(maxLen * 0.2))) {
+      bestDist = dist;
+      best = c;
+    }
+  }
+  if (best) {
+    const maxLen = Math.max(normTarget.length, normalizeName(best.player).length);
+    return { match: best, score: 1 - (bestDist / maxLen), exact: false };
+  }
+  return null;
 };
 
 // ==================== HELPERS ====================
@@ -259,7 +335,8 @@ const PosBadge = ({ pos, size = 'md' }) => {
 export default function App() {
   const [loading, setLoading] = useState(true);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [rankings, setRankings] = useState([]);
+  // rankings is now { rank1: [...], rank2: [...], rank3: [...] }
+  const [rankingsSources, setRankingsSources] = useState({ rank1: [], rank2: [], rank3: [] });
   const [adp, setAdp] = useState({});
   const [targets, setTargets] = useState([]);
   const [draft, setDraft] = useState({}); // { pickNum: playerName }
@@ -273,14 +350,19 @@ export default function App() {
     (async () => {
       const [s, r, a, t, d, u] = await Promise.all([
         loadStorage(KEYS.settings, DEFAULT_SETTINGS),
-        loadStorage(KEYS.rankings, []),
+        loadStorage(KEYS.rankings, { rank1: [], rank2: [], rank3: [] }),
         loadStorage(KEYS.adp, {}),
         loadStorage(KEYS.targets, []),
         loadStorage(KEYS.draft, {}),
         loadStorage(KEYS.ui, { activeView: 'dashboard', showHelp: false }),
       ]);
       setSettings({ ...DEFAULT_SETTINGS, ...s });
-      setRankings(r);
+      // Migrate old format: if r is an array (old single-list format), move it to rank1
+      if (Array.isArray(r)) {
+        setRankingsSources({ rank1: r, rank2: [], rank3: [] });
+      } else {
+        setRankingsSources({ rank1: r.rank1 || [], rank2: r.rank2 || [], rank3: r.rank3 || [] });
+      }
       setAdp(a);
       setTargets(t);
       setDraft(d);
@@ -291,11 +373,111 @@ export default function App() {
 
   // Auto-save on change (debounced)
   useEffect(() => { if (!loading) saveStorage(KEYS.settings, settings); }, [settings, loading]);
-  useEffect(() => { if (!loading) saveStorage(KEYS.rankings, rankings); }, [rankings, loading]);
+  useEffect(() => { if (!loading) saveStorage(KEYS.rankings, rankingsSources); }, [rankingsSources, loading]);
   useEffect(() => { if (!loading) saveStorage(KEYS.adp, adp); }, [adp, loading]);
   useEffect(() => { if (!loading) saveStorage(KEYS.targets, targets); }, [targets, loading]);
   useEffect(() => { if (!loading) saveStorage(KEYS.draft, draft); }, [draft, loading]);
   useEffect(() => { if (!loading) saveStorage(KEYS.ui, ui); }, [ui, loading]);
+
+  // ==================== AGGREGATE RANKINGS ====================
+  // Build a 4th rankings list from the average of all loaded sources.
+  // Uses name matching across sources.
+  const aggregateRankings = useMemo(() => {
+    const sources = ['rank1', 'rank2', 'rank3'].filter(k => rankingsSources[k]?.length > 0);
+    if (sources.length === 0) return [];
+
+    // Build a map: normalized name → array of { source, rank, player object }
+    // We anchor on the first source with the most data, then match others into it.
+    const sourceData = sources.map(k => rankingsSources[k]);
+    const totalPlayers = sourceData.reduce((sum, s) => sum + s.length, 0);
+
+    // Collect all unique players by walking each source and matching to a master list
+    const masterList = []; // { player, team, pos, ranksBySource: { rank1: x, rank2: y, rank3: z }, sourcesFound: [...] }
+    const playerByNormName = {}; // normalized name → masterList entry
+
+    sources.forEach(sourceKey => {
+      const list = rankingsSources[sourceKey];
+      list.forEach(p => {
+        if (!p.player) return;
+        const norm = normalizeName(p.player);
+        // Try exact normalized match first
+        let entry = playerByNormName[norm];
+        // Try fuzzy match against existing entries (same position)
+        if (!entry) {
+          const match = findBestNameMatch(p.player, masterList, p.pos);
+          if (match) {
+            entry = match.match;
+          }
+        }
+        if (!entry) {
+          entry = {
+            player: p.player,
+            team: p.team,
+            pos: p.pos,
+            bye: p.bye,
+            ranksBySource: {},
+            sourcesFound: [],
+            // Track all alias names seen across sources
+            aliases: [p.player],
+          };
+          masterList.push(entry);
+          playerByNormName[norm] = entry;
+        } else {
+          // Fill in missing fields if other source has them
+          if (!entry.team && p.team) entry.team = p.team;
+          if (!entry.bye && p.bye) entry.bye = p.bye;
+          if (!entry.aliases.includes(p.player)) entry.aliases.push(p.player);
+        }
+        entry.ranksBySource[sourceKey] = p.overallRank;
+        if (!entry.sourcesFound.includes(sourceKey)) entry.sourcesFound.push(sourceKey);
+      });
+    });
+
+    // Compute aggregate rank for each player as the average of available source ranks
+    // Players found in fewer sources get a penalty: missing source = ranked at (sourceLength + 50)
+    masterList.forEach(entry => {
+      const ranks = [];
+      sources.forEach(sk => {
+        if (entry.ranksBySource[sk] != null) {
+          ranks.push(entry.ranksBySource[sk]);
+        } else {
+          // Penalty for missing: assume they would be ranked just past the end of that source
+          const sourceLength = rankingsSources[sk].length;
+          ranks.push(sourceLength + 50);
+        }
+      });
+      entry.aggregateScore = ranks.reduce((a, b) => a + b, 0) / ranks.length;
+    });
+
+    // Sort by aggregate score (ascending = best)
+    masterList.sort((a, b) => a.aggregateScore - b.aggregateScore);
+
+    // Assign overall ranks and position ranks
+    const posCounters = {};
+    return masterList.map((entry, idx) => {
+      const pos = entry.pos;
+      posCounters[pos] = (posCounters[pos] || 0) + 1;
+      return {
+        id: `agg-${idx}`,
+        player: entry.player,
+        team: entry.team,
+        pos: entry.pos,
+        overallRank: idx + 1,
+        posRank: posCounters[pos],
+        bye: entry.bye,
+        tier: null, // tiers don't aggregate well
+        notes: `In ${entry.sourcesFound.length}/${sources.length} sources`,
+        sourcesFound: entry.sourcesFound,
+        aliases: entry.aliases,
+      };
+    });
+  }, [rankingsSources]);
+
+  // The active ranking source for dashboard calculations
+  const rankings = useMemo(() => {
+    if (settings.activeRankings === 'aggregate') return aggregateRankings;
+    return rankingsSources[settings.activeRankings] || [];
+  }, [settings.activeRankings, rankingsSources, aggregateRankings]);
 
   // ==================== COMPUTED STATE ====================
   const draftedSet = useMemo(() => {
@@ -428,6 +610,13 @@ export default function App() {
         // Example: ADP 18.3, currentPick 6 -> 6 - 18.3 = -12.3 (reaching by 12 picks)
         // Example: ADP 5, currentPick 20 -> 20 - 5 = +15 (steal — fell 15 picks past ADP)
         const valueVsPick = playerAdp != null ? currentPick - playerAdp : null;
+
+        // valueVsMyRank: positive = ADP says they're cheaper than I rank them (market undervalues)
+        // negative = ADP says they go earlier than I rank them (market overvalues)
+        // Example: My Rank 5, ADP 18 -> 18 - 5 = +13 (market undervalues — go get them)
+        // Example: My Rank 20, ADP 5 -> 5 - 20 = -15 (market overdrafts — fade)
+        const valueVsMyRank = (playerAdp != null && r.overallRank != null) ? playerAdp - r.overallRank : null;
+
         const dynRank = r.overallRank - (rosterNeedBump[r.pos] || 0) - (scarcityBump[r.pos] || 0);
 
         let flag = null;
@@ -436,6 +625,15 @@ export default function App() {
           else if (valueVsPick >= settings.thresholds.value) flag = 'VALUE';
           else if (valueVsPick <= -settings.thresholds.reach) flag = 'REACH';
           else flag = 'FAIR';
+        }
+
+        // Personal flag from my-rank perspective
+        let myFlag = null;
+        if (valueVsMyRank != null) {
+          if (valueVsMyRank >= settings.thresholds.steal) myFlag = 'STEAL';
+          else if (valueVsMyRank >= settings.thresholds.value) myFlag = 'VALUE';
+          else if (valueVsMyRank <= -settings.thresholds.reach) myFlag = 'REACH';
+          else myFlag = 'FAIR';
         }
 
         let snipeRisk = null;
@@ -452,8 +650,10 @@ export default function App() {
           ...r,
           adp: playerAdp,
           valueVsPick,
+          valueVsMyRank,
           dynRank,
           flag,
+          myFlag,
           snipeRisk,
           isTarget,
           targetPriority: targetData?.priority || null,
@@ -567,7 +767,7 @@ export default function App() {
   const handleClearAll = () => {
     if (window.confirm('Clear EVERYTHING — settings, rankings, ADP, targets, and draft? This cannot be undone.')) {
       setSettings(DEFAULT_SETTINGS);
-      setRankings([]);
+      setRankingsSources({ rank1: [], rank2: [], rank3: [] });
       setAdp({});
       setTargets([]);
       setDraft({});
@@ -661,7 +861,10 @@ export default function App() {
         {ui.activeView === 'dashboard' && (
           <DashboardView
             settings={settings}
+            setSettings={setSettings}
             rankings={rankings}
+            rankingsSources={rankingsSources}
+            aggregateRankings={aggregateRankings}
             currentPick={currentPick}
             currentRound={currentRound}
             currentTeam={currentTeam}
@@ -686,7 +889,13 @@ export default function App() {
         )}
 
         {ui.activeView === 'rankings' && (
-          <RankingsView rankings={rankings} setRankings={setRankings} />
+          <RankingsView
+            rankingsSources={rankingsSources}
+            setRankingsSources={setRankingsSources}
+            aggregateRankings={aggregateRankings}
+            settings={settings}
+            setSettings={setSettings}
+          />
         )}
 
         {ui.activeView === 'adp' && (
@@ -724,21 +933,88 @@ export default function App() {
 
 // ==================== DASHBOARD VIEW ====================
 function DashboardView({
-  settings, rankings, currentPick, currentRound, currentTeam, isMyTurn,
+  settings, setSettings, rankings, rankingsSources, aggregateRankings,
+  currentPick, currentRound, currentTeam, isMyTurn,
   myNextPick, picksUntilMyTurn, myDrafted, posCounts, availablePlayers,
   tierBreakdown, opponentNeeds, recommendedPicks, byeConflicts,
   positionRuns, targets, draftedSet, playerToPick, onDraft, onUndraft, adp
 }) {
   const [searchQuery, setSearchQuery] = useState('');
+  const [posFilter, setPosFilter] = useState('ALL'); // ALL | QB | RB | WR | TE | K | DST | FLEX
+  const [sortKey, setSortKey] = useState('dynRank'); // dynRank | overallRank | adp | tier | valueVsPick | valueVsMyRank | player | pos
+  const [sortDir, setSortDir] = useState('asc'); // asc | desc
+
+  const handleSort = (key) => {
+    if (sortKey === key) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      // Sensible defaults: ranks/ADP ascending (lower=better), values descending (higher=better)
+      setSortDir(['valueVsPick', 'valueVsMyRank'].includes(key) ? 'desc' : 'asc');
+    }
+  };
+
   const filteredAvailable = useMemo(() => {
-    if (!searchQuery) return availablePlayers;
-    const q = searchQuery.toLowerCase();
-    return availablePlayers.filter(p =>
-      p.player.toLowerCase().includes(q) ||
-      p.pos.toLowerCase().includes(q) ||
-      p.team.toLowerCase().includes(q)
-    );
-  }, [availablePlayers, searchQuery]);
+    let list = availablePlayers;
+
+    // Position filter
+    if (posFilter !== 'ALL') {
+      if (posFilter === 'FLEX') {
+        list = list.filter(p => ['RB', 'WR', 'TE'].includes(p.pos));
+      } else {
+        list = list.filter(p => p.pos === posFilter);
+      }
+    }
+
+    // Search filter
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter(p =>
+        p.player.toLowerCase().includes(q) ||
+        p.pos.toLowerCase().includes(q) ||
+        (p.team || '').toLowerCase().includes(q)
+      );
+    }
+
+    // Sort
+    const sorted = [...list].sort((a, b) => {
+      let av = a[sortKey];
+      let bv = b[sortKey];
+      // Treat null/undefined as worst
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === 'string') {
+        return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+      }
+      return sortDir === 'asc' ? av - bv : bv - av;
+    });
+    return sorted;
+  }, [availablePlayers, searchQuery, posFilter, sortKey, sortDir]);
+
+  // Active source label + counts for the dropdown
+  const sourceOptions = useMemo(() => {
+    const opts = [];
+    ['rank1', 'rank2', 'rank3'].forEach(key => {
+      const count = rankingsSources[key]?.length || 0;
+      opts.push({
+        key,
+        label: settings.rankingLabels?.[key] || key,
+        count,
+        disabled: count === 0,
+      });
+    });
+    const aggCount = aggregateRankings.length;
+    const sourcesLoaded = ['rank1', 'rank2', 'rank3'].filter(k => rankingsSources[k]?.length > 0).length;
+    opts.push({
+      key: 'aggregate',
+      label: settings.rankingLabels?.aggregate || 'Aggregate',
+      count: aggCount,
+      disabled: sourcesLoaded < 2,
+      sublabel: sourcesLoaded < 2 ? 'Need 2+ sources' : `Avg of ${sourcesLoaded} sources`,
+    });
+    return opts;
+  }, [rankingsSources, aggregateRankings, settings.rankingLabels]);
 
   if (rankings.length === 0) {
     return (
@@ -844,7 +1120,13 @@ function DashboardView({
             icon={<Crown className="w-4 h-4" />}
             accent="cyan"
             actions={
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                {/* Rankings source dropdown */}
+                <RankingsSourceDropdown
+                  sourceOptions={sourceOptions}
+                  activeKey={settings.activeRankings}
+                  onChange={(key) => setSettings(s => ({ ...s, activeRankings: key }))}
+                />
                 <div className="relative">
                   <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-stone-500" />
                   <input
@@ -861,26 +1143,53 @@ function DashboardView({
               </div>
             }
           >
+            {/* Position filter pills */}
+            <div className="flex items-center gap-1 mb-3 flex-wrap">
+              {['ALL', 'QB', 'RB', 'WR', 'TE', 'FLEX', 'K', 'DST'].map(pos => {
+                const count = pos === 'ALL'
+                  ? availablePlayers.length
+                  : pos === 'FLEX'
+                    ? availablePlayers.filter(p => ['RB', 'WR', 'TE'].includes(p.pos)).length
+                    : availablePlayers.filter(p => p.pos === pos).length;
+                const active = posFilter === pos;
+                return (
+                  <button
+                    key={pos}
+                    onClick={() => setPosFilter(pos)}
+                    className={`px-2.5 py-1 rounded text-[10px] font-mono uppercase tracking-wider border flex items-center gap-1.5 transition-all ${
+                      active
+                        ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                        : 'bg-stone-900 text-stone-400 border-stone-800 hover:bg-stone-800'
+                    }`}
+                  >
+                    {pos}
+                    <span className={`font-bold ${active ? 'text-cyan-400' : 'text-stone-600'}`}>{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+
             <div className="overflow-x-auto scrollbar-thin">
               <table className="w-full">
                 <thead>
                   <tr className="text-[10px] uppercase tracking-wider text-stone-500 font-mono border-b border-stone-800">
-                    <th className="text-left py-2 px-3 font-medium">Dyn</th>
-                    <th className="text-left py-2 px-3 font-medium">My</th>
-                    <th className="text-left py-2 px-3 font-medium">Player</th>
-                    <th className="text-left py-2 px-3 font-medium">Pos</th>
+                    <SortableTh sortKey="dynRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Dyn</SortableTh>
+                    <SortableTh sortKey="overallRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>My</SortableTh>
+                    <SortableTh sortKey="player" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Player</SortableTh>
+                    <SortableTh sortKey="pos" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Pos</SortableTh>
                     <th className="text-left py-2 px-3 font-medium">Tm</th>
                     <th className="text-left py-2 px-3 font-medium">Bye</th>
-                    <th className="text-left py-2 px-3 font-medium">Tier</th>
-                    <th className="text-left py-2 px-3 font-medium">ADP</th>
-                    <th className="text-left py-2 px-3 font-medium">Δ</th>
+                    <SortableTh sortKey="tier" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Tier</SortableTh>
+                    <SortableTh sortKey="adp" currentKey={sortKey} dir={sortDir} onSort={handleSort}>ADP</SortableTh>
+                    <SortableTh sortKey="valueVsPick" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="ADP vs current pick">Pick Δ</SortableTh>
+                    <SortableTh sortKey="valueVsMyRank" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="ADP vs your ranking">My Δ</SortableTh>
                     <th className="text-left py-2 px-3 font-medium">Flag</th>
                     <th className="text-left py-2 px-3 font-medium">Snipe</th>
                     <th className="text-right py-2 px-3 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono text-xs">
-                  {filteredAvailable.slice(0, 30).map((p, i) => (
+                  {filteredAvailable.slice(0, 50).map((p, i) => (
                     <tr key={p.id || p.player} className={`border-b border-stone-900 hover:bg-stone-800/40 transition-colors ${p.isTarget ? 'bg-amber-500/5' : i % 2 === 0 ? 'bg-stone-900/20' : ''}`}>
                       <td className="py-2 px-3">
                         <span className={`font-bold ${p.dynRank < p.overallRank ? 'text-cyan-400' : p.dynRank > p.overallRank ? 'text-amber-400' : 'text-stone-200'}`}>
@@ -908,6 +1217,13 @@ function DashboardView({
                       }`}>
                         {p.valueVsPick == null ? '—' : (p.valueVsPick > 0 ? '+' : '') + p.valueVsPick.toFixed(0)}
                       </td>
+                      <td className={`py-2 px-3 font-bold ${
+                        p.valueVsMyRank == null ? 'text-stone-600' :
+                        p.valueVsMyRank >= 6 ? 'text-emerald-400' :
+                        p.valueVsMyRank <= -6 ? 'text-rose-400' : 'text-stone-400'
+                      }`}>
+                        {p.valueVsMyRank == null ? '—' : (p.valueVsMyRank > 0 ? '+' : '') + p.valueVsMyRank.toFixed(0)}
+                      </td>
                       <td className="py-2 px-3">
                         {p.flag === 'STEAL' && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">STEAL</span>}
                         {p.flag === 'VALUE' && <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">VALUE</span>}
@@ -934,7 +1250,7 @@ function DashboardView({
                 </tbody>
               </table>
               {filteredAvailable.length === 0 && (
-                <div className="text-center py-8 text-stone-600 text-sm">No players match your search</div>
+                <div className="text-center py-8 text-stone-600 text-sm">No players match your filters</div>
               )}
             </div>
           </Panel>
@@ -1478,6 +1794,84 @@ function RosterSlots({ myDrafted, settings, onUndraft }) {
   );
 }
 
+// ==================== SORTABLE TH ====================
+function SortableTh({ sortKey, currentKey, dir, onSort, children, align = 'left', title }) {
+  const isActive = currentKey === sortKey;
+  return (
+    <th
+      onClick={() => onSort(sortKey)}
+      title={title}
+      className={`text-${align} py-2 px-3 font-medium cursor-pointer select-none hover:text-stone-300 transition-colors ${isActive ? 'text-cyan-300' : ''}`}
+    >
+      <span className="inline-flex items-center gap-1">
+        {children}
+        {isActive && (
+          <span className="text-[8px] leading-none">{dir === 'asc' ? '▲' : '▼'}</span>
+        )}
+      </span>
+    </th>
+  );
+}
+
+// ==================== RANKINGS SOURCE DROPDOWN ====================
+function RankingsSourceDropdown({ sourceOptions, activeKey, onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handler = (e) => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    if (open) document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const active = sourceOptions.find(o => o.key === activeKey) || sourceOptions[0];
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-stone-900 hover:bg-stone-800 border border-stone-700 text-stone-200 text-xs font-mono uppercase tracking-wider transition-all"
+      >
+        <BarChart3 className="w-3 h-3 text-cyan-400" />
+        <span>{active?.label || 'Rankings'}</span>
+        <span className="text-stone-500 font-normal text-[10px]">({active?.count || 0})</span>
+        <ChevronDown className={`w-3 h-3 text-stone-500 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute top-full right-0 mt-1 bg-stone-900 border border-stone-700 rounded-lg shadow-2xl z-30 overflow-hidden min-w-[220px]">
+          <div className="px-3 py-2 border-b border-stone-800 font-mono text-[10px] uppercase tracking-wider text-stone-500">
+            Switch rankings source
+          </div>
+          {sourceOptions.map(opt => (
+            <button
+              key={opt.key}
+              disabled={opt.disabled}
+              onClick={() => { if (!opt.disabled) { onChange(opt.key); setOpen(false); } }}
+              className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors ${
+                opt.disabled ? 'opacity-40 cursor-not-allowed' :
+                activeKey === opt.key ? 'bg-cyan-500/15 text-cyan-200' : 'hover:bg-stone-800 text-stone-200'
+              }`}
+            >
+              <div className="flex flex-col">
+                <span className="font-mono text-xs font-bold">
+                  {opt.key === 'aggregate' && '★ '}
+                  {opt.label}
+                </span>
+                {opt.sublabel && (
+                  <span className="font-mono text-[9px] text-stone-500">{opt.sublabel}</span>
+                )}
+              </div>
+              <span className="font-mono text-[10px] text-stone-500">{opt.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ==================== PANEL COMPONENT ====================
 function Panel({ title, icon, accent = 'stone', actions, children }) {
   const accentColors = {
@@ -1515,19 +1909,36 @@ function Panel({ title, icon, accent = 'stone', actions, children }) {
 }
 
 // ==================== RANKINGS VIEW ====================
-function RankingsView({ rankings, setRankings }) {
-  const [pasteMode, setPasteMode] = useState(rankings.length === 0);
+function RankingsView({ rankingsSources, setRankingsSources, aggregateRankings, settings, setSettings }) {
+  // Active source being viewed/edited
+  const [activeSource, setActiveSource] = useState(() => {
+    // Default to first source with data, or rank1
+    const sources = ['rank1', 'rank2', 'rank3'];
+    return sources.find(s => rankingsSources[s]?.length > 0) || 'rank1';
+  });
   const [pasteText, setPasteText] = useState('');
+  const [pasteMode, setPasteMode] = useState(false);
   const [filterPos, setFilterPos] = useState('ALL');
   const [search, setSearch] = useState('');
+
+  const isAggregate = activeSource === 'aggregate';
+  const currentList = isAggregate ? aggregateRankings : (rankingsSources[activeSource] || []);
+
+  const setCurrentList = (updater) => {
+    if (isAggregate) return; // can't edit aggregate
+    setRankingsSources(s => ({
+      ...s,
+      [activeSource]: typeof updater === 'function' ? updater(s[activeSource] || []) : updater,
+    }));
+  };
 
   const handlePaste = () => {
     const parsed = parseRankings(pasteText);
     if (parsed.length === 0) {
-      alert('No players parsed. Make sure your data has columns: Player, Team, Position, Overall Rank (tab or comma separated).');
+      alert('No players parsed. Make sure your data has a header row with columns like Player, Team, Position, Rank.');
       return;
     }
-    setRankings(parsed);
+    setCurrentList(parsed);
     setPasteText('');
     setPasteMode(false);
   };
@@ -1535,56 +1946,145 @@ function RankingsView({ rankings, setRankings }) {
   const handleAppend = () => {
     const parsed = parseRankings(pasteText);
     if (parsed.length === 0) return;
-    setRankings(r => [...r, ...parsed]);
+    setCurrentList(r => [...r, ...parsed]);
     setPasteText('');
   };
 
   const handleEdit = (id, field, value) => {
-    setRankings(rs => rs.map(r => r.id === id ? { ...r, [field]: value } : r));
+    setCurrentList(rs => rs.map(r => r.id === id ? { ...r, [field]: value } : r));
   };
 
   const handleDelete = (id) => {
-    setRankings(rs => rs.filter(r => r.id !== id));
+    setCurrentList(rs => rs.filter(r => r.id !== id));
+  };
+
+  const handleRenameSource = (newLabel) => {
+    setSettings(s => ({
+      ...s,
+      rankingLabels: { ...(s.rankingLabels || {}), [activeSource]: newLabel },
+    }));
+  };
+
+  const handleClearSource = () => {
+    if (window.confirm(`Clear all rankings in "${settings.rankingLabels?.[activeSource] || activeSource}"?`)) {
+      setCurrentList([]);
+    }
   };
 
   const filtered = useMemo(() => {
-    return rankings.filter(r => {
+    return currentList.filter(r => {
       if (filterPos !== 'ALL' && r.pos !== filterPos) return false;
       if (search && !r.player.toLowerCase().includes(search.toLowerCase())) return false;
       return true;
     });
-  }, [rankings, filterPos, search]);
+  }, [currentList, filterPos, search]);
+
+  const sourceTotal = (key) => key === 'aggregate' ? aggregateRankings.length : (rankingsSources[key]?.length || 0);
+  const sourcesLoadedCount = ['rank1', 'rank2', 'rank3'].filter(k => rankingsSources[k]?.length > 0).length;
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="font-display text-3xl text-white">Rankings</h1>
-          <p className="text-stone-500 text-sm font-mono mt-1">{rankings.length} players loaded</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setPasteMode(p => !p)}
-            className="px-3 py-2 rounded bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-xs font-mono uppercase tracking-wider flex items-center gap-1.5"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            {pasteMode ? 'Cancel' : 'Paste Rankings'}
-          </button>
-          {rankings.length > 0 && (
-            <button
-              onClick={() => { if (window.confirm('Clear all rankings?')) setRankings([]); }}
-              className="px-3 py-2 rounded bg-stone-900 hover:bg-rose-500/20 border border-stone-700 hover:border-rose-500/30 text-stone-400 hover:text-rose-300 text-xs font-mono uppercase tracking-wider flex items-center gap-1.5"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              Clear
-            </button>
-          )}
+          <p className="text-stone-500 text-sm font-mono mt-1">
+            {sourcesLoadedCount} of 3 sources loaded
+            {sourcesLoadedCount >= 2 && ` • aggregate built from ${sourcesLoadedCount} sources`}
+          </p>
         </div>
       </div>
 
-      {pasteMode && (
+      {/* Source tabs */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900/30 p-1.5 flex items-center gap-1 flex-wrap">
+        {['rank1', 'rank2', 'rank3', 'aggregate'].map(key => {
+          const isActive = activeSource === key;
+          const count = sourceTotal(key);
+          const isAgg = key === 'aggregate';
+          const aggDisabled = isAgg && sourcesLoadedCount < 2;
+          return (
+            <button
+              key={key}
+              disabled={aggDisabled}
+              onClick={() => setActiveSource(key)}
+              className={`px-3 py-2 rounded-lg flex items-center gap-2 transition-all ${
+                aggDisabled ? 'opacity-30 cursor-not-allowed' :
+                isActive
+                  ? isAgg ? 'bg-amber-500/15 border border-amber-500/40' : 'bg-cyan-500/15 border border-cyan-500/40'
+                  : 'hover:bg-stone-800/50 border border-transparent'
+              }`}
+            >
+              <span className={`font-mono text-xs font-bold uppercase tracking-wider ${
+                isActive ? (isAgg ? 'text-amber-300' : 'text-cyan-300') : 'text-stone-400'
+              }`}>
+                {isAgg && '★ '}{settings.rankingLabels?.[key] || key}
+              </span>
+              <span className={`font-mono text-[10px] ${isActive ? 'text-stone-300' : 'text-stone-600'}`}>
+                {count}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Active source controls */}
+      {!isAggregate && (
+        <div className="rounded-xl border border-stone-800 bg-stone-900/30 p-4">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-3 flex-1">
+              <div className="font-mono text-[10px] text-stone-500 uppercase tracking-wider">Source name:</div>
+              <input
+                type="text"
+                value={settings.rankingLabels?.[activeSource] || ''}
+                onChange={(e) => handleRenameSource(e.target.value)}
+                placeholder="e.g. ESPN, FantasyPros, MyRanks"
+                className="bg-stone-950 border border-stone-700 rounded px-3 py-1.5 font-mono text-xs text-stone-200 focus:outline-none focus:border-cyan-500/50 max-w-[240px]"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPasteMode(p => !p)}
+                className="px-3 py-1.5 rounded bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-xs font-mono uppercase tracking-wider flex items-center gap-1.5"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                {pasteMode ? 'Cancel' : 'Paste'}
+              </button>
+              {currentList.length > 0 && (
+                <button
+                  onClick={handleClearSource}
+                  className="px-3 py-1.5 rounded bg-stone-900 hover:bg-rose-500/20 border border-stone-700 hover:border-rose-500/30 text-stone-400 hover:text-rose-300 text-xs font-mono uppercase tracking-wider flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isAggregate && (
+        <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+          <div className="flex items-start gap-3">
+            <Star className="w-5 h-5 text-amber-400 fill-amber-400/30 flex-shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="font-mono text-xs text-amber-300 uppercase tracking-wider mb-1">Aggregate Rankings</div>
+              <div className="text-stone-300 text-sm">
+                Auto-computed from your {sourcesLoadedCount} loaded source{sourcesLoadedCount > 1 ? 's' : ''}. Names are fuzzy-matched across sources (handles A.J. Brown vs AJ Brown, etc.).
+                Each player's aggregate rank is the average of their ranks across sources. Players found in fewer sources get a small penalty.
+              </div>
+              <div className="text-stone-500 text-xs font-mono mt-2">
+                Read-only — to change, edit the source rankings.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pasteMode && !isAggregate && (
         <div className="rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-4">
-          <div className="font-mono text-xs text-cyan-300 mb-2 uppercase tracking-wider">Paste Rankings</div>
+          <div className="font-mono text-xs text-cyan-300 mb-2 uppercase tracking-wider">
+            Paste Rankings into "{settings.rankingLabels?.[activeSource] || activeSource}"
+          </div>
           <div className="text-stone-400 text-xs mb-3">
             <span className="text-cyan-300">Smart paste:</span> include a header row with any of these column names — <span className="font-mono text-stone-300">Player, Team, Position, Rank, Bye, Tier, Notes</span> — in any order. Position Rank auto-computes from your overall ranks.
             <br />Tab or comma separated.
@@ -1614,7 +2114,7 @@ function RankingsView({ rankings, setRankings }) {
         </div>
       )}
 
-      {rankings.length > 0 && (
+      {currentList.length > 0 && (
         <>
           <div className="flex items-center gap-3">
             <div className="relative flex-1 max-w-xs">
@@ -1657,25 +2157,40 @@ function RankingsView({ rankings, setRankings }) {
                     <th className="text-left py-2 px-3 font-medium w-12">Bye</th>
                     <th className="text-left py-2 px-3 font-medium w-12">Tier</th>
                     <th className="text-left py-2 px-3 font-medium">Notes</th>
-                    <th className="w-10"></th>
+                    {!isAggregate && <th className="w-10"></th>}
                   </tr>
                 </thead>
                 <tbody className="font-mono text-xs">
                   {filtered.map((r) => (
                     <tr key={r.id} className="border-t border-stone-900 hover:bg-stone-900/50">
-                      <EditableCell value={r.overallRank} onChange={(v) => handleEdit(r.id, 'overallRank', parseInt(v) || 0)} type="number" />
-                      <EditableCell value={r.player} onChange={(v) => handleEdit(r.id, 'player', v)} className="font-semibold text-stone-100" />
-                      <EditableCell value={r.team} onChange={(v) => handleEdit(r.id, 'team', v)} />
-                      <td className="py-1.5 px-3"><PosBadge pos={r.pos} size="sm" /></td>
-                      <EditableCell value={r.posRank || ''} onChange={(v) => handleEdit(r.id, 'posRank', parseInt(v) || null)} type="number" />
-                      <EditableCell value={r.bye || ''} onChange={(v) => handleEdit(r.id, 'bye', parseInt(v) || null)} type="number" />
-                      <EditableCell value={r.tier || ''} onChange={(v) => handleEdit(r.id, 'tier', parseInt(v) || null)} type="number" />
-                      <EditableCell value={r.notes} onChange={(v) => handleEdit(r.id, 'notes', v)} />
-                      <td className="py-1.5 px-2">
-                        <button onClick={() => handleDelete(r.id)} className="text-stone-600 hover:text-rose-400">
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      </td>
+                      {isAggregate ? (
+                        <>
+                          <td className="py-1.5 px-3 text-stone-300">{r.overallRank}</td>
+                          <td className="py-1.5 px-3 font-semibold text-stone-100">{r.player}</td>
+                          <td className="py-1.5 px-3 text-stone-400">{r.team}</td>
+                          <td className="py-1.5 px-3"><PosBadge pos={r.pos} size="sm" /></td>
+                          <td className="py-1.5 px-3 text-stone-400">{r.pos}{r.posRank}</td>
+                          <td className="py-1.5 px-3 text-stone-400">{r.bye || '—'}</td>
+                          <td className="py-1.5 px-3 text-stone-700">—</td>
+                          <td className="py-1.5 px-3 text-stone-500 text-[10px]">{r.notes}</td>
+                        </>
+                      ) : (
+                        <>
+                          <EditableCell value={r.overallRank} onChange={(v) => handleEdit(r.id, 'overallRank', parseInt(v) || 0)} type="number" />
+                          <EditableCell value={r.player} onChange={(v) => handleEdit(r.id, 'player', v)} className="font-semibold text-stone-100" />
+                          <EditableCell value={r.team} onChange={(v) => handleEdit(r.id, 'team', v)} />
+                          <td className="py-1.5 px-3"><PosBadge pos={r.pos} size="sm" /></td>
+                          <EditableCell value={r.posRank || ''} onChange={(v) => handleEdit(r.id, 'posRank', parseInt(v) || null)} type="number" />
+                          <EditableCell value={r.bye || ''} onChange={(v) => handleEdit(r.id, 'bye', parseInt(v) || null)} type="number" />
+                          <EditableCell value={r.tier || ''} onChange={(v) => handleEdit(r.id, 'tier', parseInt(v) || null)} type="number" />
+                          <EditableCell value={r.notes} onChange={(v) => handleEdit(r.id, 'notes', v)} />
+                          <td className="py-1.5 px-2">
+                            <button onClick={() => handleDelete(r.id)} className="text-stone-600 hover:text-rose-400">
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </>
+                      )}
                     </tr>
                   ))}
                 </tbody>
@@ -1683,6 +2198,18 @@ function RankingsView({ rankings, setRankings }) {
             </div>
           </div>
         </>
+      )}
+
+      {currentList.length === 0 && !pasteMode && (
+        <div className="flex flex-col items-center justify-center py-16 text-center rounded-xl border border-dashed border-stone-800">
+          <BarChart3 className="w-12 h-12 text-stone-700 mb-3" />
+          <div className="font-display text-xl text-stone-400 mb-2">
+            {isAggregate ? 'Need at least 2 sources to build aggregate' : `No rankings in "${settings.rankingLabels?.[activeSource] || activeSource}"`}
+          </div>
+          <div className="text-stone-600 text-sm font-mono">
+            {isAggregate ? 'Load rankings into rank1, rank2, or rank3 to see aggregate here' : 'Click Paste above to add rankings'}
+          </div>
+        </div>
       )}
     </div>
   );
