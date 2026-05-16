@@ -109,8 +109,8 @@ const findBestNameMatch = (target, candidates, pos = null) => {
 // ==================== HELPERS ====================
 const loadStorage = async (key, fallback) => {
   try {
-    const result = await window.storage.get(key);
-    return result ? JSON.parse(result.value) : fallback;
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
   } catch {
     return fallback;
   }
@@ -118,7 +118,7 @@ const loadStorage = async (key, fallback) => {
 
 const saveStorage = async (key, value) => {
   try {
-    await window.storage.set(key, JSON.stringify(value));
+    localStorage.setItem(key, JSON.stringify(value));
   } catch (e) {
     console.error('Storage error:', e);
   }
@@ -940,6 +940,7 @@ export default function App() {
             onDraft={handleDraftPlayer}
             onUndraft={handleUndraftPlayer}
             adp={adp}
+            draft={draft}
           />
         )}
 
@@ -992,22 +993,50 @@ function DashboardView({
   currentPick, currentRound, currentTeam, isMyTurn,
   myNextPick, picksUntilMyTurn, myDrafted, posCounts, availablePlayers,
   tierBreakdown, opponentNeeds, recommendedPicks, byeConflicts,
-  positionRuns, targets, draftedSet, playerToPick, onDraft, onUndraft, adp
+  positionRuns, targets, draftedSet, playerToPick, onDraft, onUndraft, adp, draft
 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [posFilter, setPosFilter] = useState('ALL'); // ALL | QB | RB | WR | TE | K | DST | FLEX
-  const [sortKey, setSortKey] = useState('dynRank'); // dynRank | overallRank | adp | tier | myRankVsPick | myRankVsAdp | player | pos
-  const [sortDir, setSortDir] = useState('asc'); // asc | desc
+  // Sort state is per-tab: { ALL: { key, dir }, QB: { key, dir }, ... }
+  const [sortByTab, setSortByTab] = useState({});
+
+  // Default sort for any tab not yet configured
+  const DEFAULT_SORT = { key: 'dynRank', dir: 'asc' };
+  const currentSort = sortByTab[posFilter] || DEFAULT_SORT;
+  const { key: sortKey, dir: sortDir } = currentSort;
 
   const handleSort = (key) => {
-    if (sortKey === key) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortKey(key);
-      // Sensible defaults: ranks/ADP ascending (lower=better), values descending (higher=better)
-      setSortDir(['myRankVsPick', 'myRankVsAdp'].includes(key) ? 'desc' : 'asc');
-    }
+    setSortByTab(prev => {
+      const existing = prev[posFilter] || DEFAULT_SORT;
+      let newDir;
+      if (existing.key === key) {
+        newDir = existing.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        // Sensible defaults: ranks/ADP ascending (lower=better), deltas descending (higher=better)
+        newDir = ['myRankVsPick', 'myRankVsAdp'].includes(key) ? 'desc' : 'asc';
+      }
+      return { ...prev, [posFilter]: { key, dir: newDir } };
+    });
   };
+
+  // When in a position-specific tab (QB/RB/WR/TE/K/DST), the displayed "rank" fields
+  // should be position-scoped, not overall. So Drake Maye is QB6 (my rank) and QB3 (ADP),
+  // and "My Δ" becomes ADP-position-rank − my-position-rank (e.g., 3 − 6 = -3 → reach).
+  // We also derive a position "pick" — how many of that position have been drafted —
+  // so Pick Δ in a position tab becomes "drafted-at-pos vs my position rank".
+  const isPositionTab = ['QB', 'RB', 'WR', 'TE', 'K', 'DST'].includes(posFilter);
+
+  // Count of each position drafted so far (for position-pick Δ)
+  const posDraftedCount = useMemo(() => {
+    const counts = { QB: 0, RB: 0, WR: 0, TE: 0, K: 0, DST: 0 };
+    Object.values(draft || {}).forEach(player => {
+      if (!player) return;
+      // Find player in the full rankings list (including drafted) to get position
+      const r = (rankings || []).find(rk => rk.player.toLowerCase() === player.toLowerCase());
+      if (r?.pos && counts[r.pos] !== undefined) counts[r.pos]++;
+    });
+    return counts;
+  }, [draft, rankings]);
 
   const filteredAvailable = useMemo(() => {
     let list = availablePlayers;
@@ -1021,6 +1050,28 @@ function DashboardView({
       }
     }
 
+    // For position-specific tabs, Pick Δ and My Δ are position-scoped (using posRank vs posPickNum and adpPosRank)
+    // The "My" column always shows overall rank regardless of tab — that's intentional, you can still see where they sit in the entire pool
+    if (isPositionTab) {
+      const posPickNum = (posDraftedCount[posFilter] || 0) + 1;
+      list = list.map(p => {
+        const posRank = p.posRank;          // already derived elsewhere
+        const adpPosRank = p.adpPosRank;    // already derived elsewhere
+        return {
+          ...p,
+          _displayMyDelta: (adpPosRank != null && posRank != null) ? adpPosRank - posRank : null,
+          _displayPickDelta: posRank != null ? posPickNum - posRank : null,
+        };
+      });
+    } else {
+      // For ALL/FLEX, use the overall-rank-based values
+      list = list.map(p => ({
+        ...p,
+        _displayMyDelta: p.myRankVsAdp,
+        _displayPickDelta: p.myRankVsPick,
+      }));
+    }
+
     // Search filter
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
@@ -1031,10 +1082,17 @@ function DashboardView({
       );
     }
 
+    // Map sort keys to actual fields. Pick Δ / My Δ sorts route to the position-aware display values.
+    const sortFieldMap = {
+      myRankVsPick: '_displayPickDelta',
+      myRankVsAdp: '_displayMyDelta',
+    };
+    const effectiveSortKey = sortFieldMap[sortKey] || sortKey;
+
     // Sort
     const sorted = [...list].sort((a, b) => {
-      let av = a[sortKey];
-      let bv = b[sortKey];
+      let av = a[effectiveSortKey];
+      let bv = b[effectiveSortKey];
       // Treat null/undefined as worst
       if (av == null && bv == null) return 0;
       if (av == null) return 1;
@@ -1045,7 +1103,7 @@ function DashboardView({
       return sortDir === 'asc' ? av - bv : bv - av;
     });
     return sorted;
-  }, [availablePlayers, searchQuery, posFilter, sortKey, sortDir]);
+  }, [availablePlayers, searchQuery, posFilter, sortKey, sortDir, isPositionTab, posDraftedCount]);
 
   // Active source label + counts for the dropdown
   const sourceOptions = useMemo(() => {
@@ -1229,15 +1287,27 @@ function DashboardView({
                 <thead>
                   <tr className="text-[10px] uppercase tracking-wider text-stone-500 font-mono border-b border-stone-800">
                     <SortableTh sortKey="dynRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Dyn</SortableTh>
-                    <SortableTh sortKey="overallRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>My</SortableTh>
+                    <SortableTh sortKey="overallRank" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="My overall rank">My</SortableTh>
+                    {isPositionTab && (
+                      <SortableTh sortKey="posRank" currentKey={sortKey} dir={sortDir} onSort={handleSort} title={`My ${posFilter} position rank`}>
+                        Pos Rk
+                      </SortableTh>
+                    )}
                     <SortableTh sortKey="player" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Player</SortableTh>
-                    <SortableTh sortKey="posRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Pos</SortableTh>
+                    {!isPositionTab && (
+                      <SortableTh sortKey="posRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Pos</SortableTh>
+                    )}
                     <th className="text-left py-2 px-3 font-medium">Tm</th>
                     <th className="text-left py-2 px-3 font-medium">Bye</th>
                     <SortableTh sortKey="tier" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Tier</SortableTh>
-                    <SortableTh sortKey="adp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="Overall ADP (and position-ADP rank)">ADP</SortableTh>
-                    <SortableTh sortKey="myRankVsPick" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="My rank vs current pick. Positive = falling past where you'd rank them. Negative = reaching by your own board.">Pick Δ</SortableTh>
-                    <SortableTh sortKey="myRankVsAdp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="My rank vs market ADP. Positive = market sleeps on them. Negative = market overdrafts them.">My Δ</SortableTh>
+                    <SortableTh sortKey="adp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="Overall ADP">Ovr ADP</SortableTh>
+                    <SortableTh sortKey="adpPosRank" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="Position-ADP rank (e.g. WR3 = 3rd WR by ADP)">Pos ADP</SortableTh>
+                    <SortableTh sortKey="myRankVsPick" currentKey={sortKey} dir={sortDir} onSort={handleSort} title={isPositionTab ? `Position rank vs position-pick (how many ${posFilter}s drafted vs my ${posFilter} ranking). Positive = falling. Negative = reaching.` : 'Overall rank vs current pick. Positive = falling past my rank. Negative = reaching by my own board.'}>
+                      Pick Δ
+                    </SortableTh>
+                    <SortableTh sortKey="myRankVsAdp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title={isPositionTab ? `Position-ADP rank vs my position rank. Positive = market sleeps on them. Negative = market overdrafts them.` : 'Overall ADP vs my overall rank. Positive = market sleeps on them. Negative = market overdrafts them.'}>
+                      My Δ
+                    </SortableTh>
                     <th className="text-left py-2 px-3 font-medium">Flag</th>
                     <th className="text-left py-2 px-3 font-medium">Snipe</th>
                     <th className="text-right py-2 px-3 font-medium">Action</th>
@@ -1251,7 +1321,14 @@ function DashboardView({
                           {Math.round(p.dynRank)}
                         </span>
                       </td>
-                      <td className="py-2 px-3 text-stone-500">{p.overallRank}</td>
+                      <td className="py-2 px-3 text-stone-300 font-bold">
+                        {p.overallRank}
+                      </td>
+                      {isPositionTab && (
+                        <td className="py-2 px-3 text-stone-300 font-bold">
+                          {p.posRank != null ? p.posRank : '—'}
+                        </td>
+                      )}
                       <td className="py-2 px-3">
                         <div className="flex items-center gap-2">
                           {p.isTarget && (
@@ -1260,42 +1337,37 @@ function DashboardView({
                           <span className="text-stone-100 font-semibold">{p.player}</span>
                         </div>
                       </td>
-                      <td className="py-2 px-3">
-                        <div className="flex items-center gap-1.5">
+                      {!isPositionTab && (
+                        <td className="py-2 px-3">
                           <PosBadge pos={p.pos} size="sm" />
-                          {p.posRank != null && (
-                            <span className="text-stone-400 text-[10px] font-mono">{p.posRank}</span>
-                          )}
-                        </div>
-                      </td>
+                        </td>
+                      )}
                       <td className="py-2 px-3 text-stone-400">{p.team}</td>
                       <td className="py-2 px-3 text-stone-400">{p.bye || '—'}</td>
                       <td className="py-2 px-3 text-stone-400">{p.tier ? `T${p.tier}` : '—'}</td>
-                      <td className="py-2 px-3">
-                        {p.adp != null ? (
-                          <div className="flex items-baseline gap-1.5">
-                            <span className="text-stone-300">{p.adp.toFixed(1)}</span>
-                            {p.adpPosRank != null && (
-                              <span className="text-stone-500 text-[10px] font-mono">{p.pos}{p.adpPosRank}</span>
-                            )}
-                          </div>
+                      <td className="py-2 px-3 text-stone-300">
+                        {p.adp != null ? p.adp.toFixed(1) : <span className="text-stone-600">—</span>}
+                      </td>
+                      <td className="py-2 px-3 text-stone-400">
+                        {p.adpPosRank != null ? (
+                          <span className="font-mono">{p.pos}{p.adpPosRank}</span>
                         ) : (
                           <span className="text-stone-600">—</span>
                         )}
                       </td>
                       <td className={`py-2 px-3 font-bold ${
-                        p.myRankVsPick == null ? 'text-stone-600' :
-                        p.myRankVsPick >= 6 ? 'text-emerald-400' :
-                        p.myRankVsPick <= -6 ? 'text-rose-400' : 'text-stone-400'
+                        p._displayPickDelta == null ? 'text-stone-600' :
+                        p._displayPickDelta >= 6 ? 'text-emerald-400' :
+                        p._displayPickDelta <= -6 ? 'text-rose-400' : 'text-stone-400'
                       }`}>
-                        {p.myRankVsPick == null ? '—' : (p.myRankVsPick > 0 ? '+' : '') + p.myRankVsPick.toFixed(0)}
+                        {p._displayPickDelta == null ? '—' : (p._displayPickDelta > 0 ? '+' : '') + p._displayPickDelta.toFixed(0)}
                       </td>
                       <td className={`py-2 px-3 font-bold ${
-                        p.myRankVsAdp == null ? 'text-stone-600' :
-                        p.myRankVsAdp >= 6 ? 'text-emerald-400' :
-                        p.myRankVsAdp <= -6 ? 'text-rose-400' : 'text-stone-400'
+                        p._displayMyDelta == null ? 'text-stone-600' :
+                        p._displayMyDelta >= 6 ? 'text-emerald-400' :
+                        p._displayMyDelta <= -6 ? 'text-rose-400' : 'text-stone-400'
                       }`}>
-                        {p.myRankVsAdp == null ? '—' : (p.myRankVsAdp > 0 ? '+' : '') + p.myRankVsAdp.toFixed(0)}
+                        {p._displayMyDelta == null ? '—' : (p._displayMyDelta > 0 ? '+' : '') + p._displayMyDelta.toFixed(0)}
                       </td>
                       <td className="py-2 px-3">
                         {p.flag === 'STEAL' && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">STEAL</span>}
@@ -1327,73 +1399,6 @@ function DashboardView({
               )}
             </div>
           </Panel>
-
-          {/* Run Tracker + Tier Breakdown */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Panel title="Position Runs" icon={<Flame className="w-4 h-4" />} accent="rose">
-              <div className="space-y-2">
-                {['QB', 'RB', 'WR', 'TE', 'K', 'DST'].map(pos => {
-                  const last5 = positionRuns.last5[pos] || 0;
-                  const last10 = positionRuns.last10[pos] || 0;
-                  const total = positionRuns.totals[pos] || 0;
-                  const isHot = last5 >= 3 || last10 >= 5;
-                  const isActive = !isHot && (last5 >= 2 || last10 >= 3);
-                  return (
-                    <div key={pos} className="flex items-center gap-3 py-1">
-                      <PosBadge pos={pos} size="sm" />
-                      <div className="flex-1 grid grid-cols-3 gap-1 font-mono text-xs">
-                        <div className="text-stone-500">Total: <span className="text-stone-200">{total}</span></div>
-                        <div className="text-stone-500">L10: <span className="text-stone-200">{last10}</span></div>
-                        <div className="text-stone-500">L5: <span className="text-stone-200">{last5}</span></div>
-                      </div>
-                      {isHot && (
-                        <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 text-[10px] font-bold flex items-center gap-1">
-                          <Flame className="w-3 h-3" /> HOT
-                        </span>
-                      )}
-                      {isActive && (
-                        <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">ACTIVE</span>
-                      )}
-                      {!isHot && !isActive && <span className="text-stone-700 text-xs">—</span>}
-                    </div>
-                  );
-                })}
-              </div>
-            </Panel>
-
-            <Panel title="Tier Scarcity" icon={<BarChart3 className="w-4 h-4" />} accent="violet">
-              <div className="overflow-x-auto scrollbar-thin">
-                <table className="w-full font-mono text-xs">
-                  <thead>
-                    <tr className="text-[10px] uppercase tracking-wider text-stone-500">
-                      <th className="text-left py-1 pr-2 font-medium">Pos</th>
-                      {['1', '2', '3', '4', '5', '6+'].map(t => (
-                        <th key={t} className="text-center py-1 px-1 font-medium">T{t}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {['QB', 'RB', 'WR', 'TE'].map(pos => (
-                      <tr key={pos} className="border-t border-stone-900">
-                        <td className="py-1.5 pr-2"><PosBadge pos={pos} size="sm" /></td>
-                        {['1', '2', '3', '4', '5', '6+'].map(t => {
-                          const count = tierBreakdown[pos]?.[t] || 0;
-                          const color = count === 0 ? 'text-stone-700' :
-                                        count <= 2 ? 'text-rose-400' :
-                                        count <= 5 ? 'text-amber-400' : 'text-emerald-400';
-                          return (
-                            <td key={t} className={`text-center py-1.5 px-1 font-bold ${color}`}>
-                              {count || '—'}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </Panel>
-          </div>
 
           {/* Opponent Needs Grid */}
           <Panel title="Opponent Needs" icon={<Users className="w-4 h-4" />} accent="amber">
@@ -1511,6 +1516,72 @@ function DashboardView({
                   </div>
                 );
               })}
+            </div>
+          </Panel>
+
+          {/* POSITION RUNS */}
+          <Panel title="Position Runs" icon={<Flame className="w-4 h-4" />} accent="rose">
+            <div className="space-y-2">
+              {['QB', 'RB', 'WR', 'TE', 'K', 'DST'].map(pos => {
+                const last5 = positionRuns.last5[pos] || 0;
+                const last10 = positionRuns.last10[pos] || 0;
+                const total = positionRuns.totals[pos] || 0;
+                const isHot = last5 >= 3 || last10 >= 5;
+                const isActive = !isHot && (last5 >= 2 || last10 >= 3);
+                return (
+                  <div key={pos} className="flex items-center gap-3 py-1">
+                    <PosBadge pos={pos} size="sm" />
+                    <div className="flex-1 grid grid-cols-3 gap-1 font-mono text-xs">
+                      <div className="text-stone-500">Total: <span className="text-stone-200">{total}</span></div>
+                      <div className="text-stone-500">L10: <span className="text-stone-200">{last10}</span></div>
+                      <div className="text-stone-500">L5: <span className="text-stone-200">{last5}</span></div>
+                    </div>
+                    {isHot && (
+                      <span className="px-2 py-0.5 rounded bg-rose-500/20 text-rose-300 text-[10px] font-bold flex items-center gap-1">
+                        <Flame className="w-3 h-3" /> HOT
+                      </span>
+                    )}
+                    {isActive && (
+                      <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">ACTIVE</span>
+                    )}
+                    {!isHot && !isActive && <span className="text-stone-700 text-xs">—</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+
+          {/* TIER SCARCITY */}
+          <Panel title="Tier Scarcity" icon={<BarChart3 className="w-4 h-4" />} accent="violet">
+            <div className="overflow-x-auto scrollbar-thin">
+              <table className="w-full font-mono text-xs">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-wider text-stone-500">
+                    <th className="text-left py-1 pr-2 font-medium">Pos</th>
+                    {['1', '2', '3', '4', '5', '6+'].map(t => (
+                      <th key={t} className="text-center py-1 px-1 font-medium">T{t}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {['QB', 'RB', 'WR', 'TE'].map(pos => (
+                    <tr key={pos} className="border-t border-stone-900">
+                      <td className="py-1.5 pr-2"><PosBadge pos={pos} size="sm" /></td>
+                      {['1', '2', '3', '4', '5', '6+'].map(t => {
+                        const count = tierBreakdown[pos]?.[t] || 0;
+                        const color = count === 0 ? 'text-stone-700' :
+                                      count <= 2 ? 'text-rose-400' :
+                                      count <= 5 ? 'text-amber-400' : 'text-emerald-400';
+                        return (
+                          <td key={t} className={`text-center py-1.5 px-1 font-bold ${color}`}>
+                            {count || '—'}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </Panel>
 
