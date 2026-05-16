@@ -109,8 +109,8 @@ const findBestNameMatch = (target, candidates, pos = null) => {
 // ==================== HELPERS ====================
 const loadStorage = async (key, fallback) => {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
+    const result = await window.storage.get(key);
+    return result ? JSON.parse(result.value) : fallback;
   } catch {
     return fallback;
   }
@@ -118,10 +118,38 @@ const loadStorage = async (key, fallback) => {
 
 const saveStorage = async (key, value) => {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    await window.storage.set(key, JSON.stringify(value));
   } catch (e) {
     console.error('Storage error:', e);
   }
+};
+
+// Derive position ranks fresh from overall rank order.
+// Given a list of players, returns a new list where each player's posRank reflects
+// their position within their position group, sorted by overallRank ascending.
+// Example: Josh Allen at overall #27 becomes QB1 if no QB has a lower overall rank.
+const derivePositionRanks = (players) => {
+  if (!players || players.length === 0) return [];
+  // Group indices by position
+  const byPosition = {};
+  players.forEach((p, idx) => {
+    if (!p?.pos) return;
+    if (!byPosition[p.pos]) byPosition[p.pos] = [];
+    byPosition[p.pos].push({ player: p, originalIdx: idx });
+  });
+  // For each position, sort by overall rank and assign 1-based posRank
+  const newPosRanks = {};
+  Object.entries(byPosition).forEach(([pos, group]) => {
+    group.sort((a, b) => (a.player.overallRank || 999999) - (b.player.overallRank || 999999));
+    group.forEach((entry, idx) => {
+      newPosRanks[entry.originalIdx] = idx + 1;
+    });
+  });
+  // Return a new list with corrected posRanks
+  return players.map((p, idx) => ({
+    ...p,
+    posRank: newPosRanks[idx] ?? p.posRank ?? null,
+  }));
 };
 
 const computeTeamForPick = (pickNum, numTeams) => {
@@ -201,7 +229,8 @@ const parseRankings = (text) => {
       team: get('team'),
       pos: get('pos').toUpperCase(),
       overallRank: getNum('overallRank') || (idx + 1),
-      posRank: getNum('posRank'),
+      // posRank is always derived from overall rank order — see second pass below
+      posRank: null,
       // Treat 0 or missing as null (unknown bye)
       bye: byeRaw && byeRaw > 0 ? byeRaw : null,
       tier: getNum('tier'),
@@ -209,8 +238,9 @@ const parseRankings = (text) => {
     };
   }).filter(r => r.player);
 
-  // Second pass: auto-compute Position Rank for any player missing one
-  // Group by position, sort by overall rank, assign sequential pos rank
+  // Second pass: ALWAYS compute Position Rank from overall rank order.
+  // Group by position, sort by overall rank ascending, assign 1-based position rank.
+  // This means QB1 = the QB with the lowest overall rank, regardless of what was pasted.
   const byPosition = {};
   parsed.forEach(p => {
     if (!byPosition[p.pos]) byPosition[p.pos] = [];
@@ -220,7 +250,7 @@ const parseRankings = (text) => {
   Object.values(byPosition).forEach(group => {
     group.sort((a, b) => (a.overallRank || 999) - (b.overallRank || 999));
     group.forEach((p, idx) => {
-      if (p.posRank == null) p.posRank = idx + 1;
+      p.posRank = idx + 1;
     });
   });
 
@@ -474,9 +504,15 @@ export default function App() {
   }, [rankingsSources]);
 
   // The active ranking source for dashboard calculations
+  // Always re-derive position ranks from overall rank order. This ensures that:
+  // - Old data from prior versions (which may have arbitrary posRanks) gets corrected
+  // - The QB ranked #27 overall correctly shows as QB1 if no other QBs are above them
+  // - Edits to overallRank automatically propagate to posRank
   const rankings = useMemo(() => {
-    if (settings.activeRankings === 'aggregate') return aggregateRankings;
-    return rankingsSources[settings.activeRankings] || [];
+    const source = settings.activeRankings === 'aggregate'
+      ? aggregateRankings
+      : (rankingsSources[settings.activeRankings] || []);
+    return derivePositionRanks(source);
   }, [settings.activeRankings, rankingsSources, aggregateRankings]);
 
   // ==================== COMPUTED STATE ====================
@@ -600,40 +636,58 @@ export default function App() {
 
   // Available players with computed dynamic rank
   const availablePlayers = useMemo(() => {
+    // First, derive a position-rank-by-ADP map across all ranked players.
+    // For each player in rankings, find their ADP, then rank within their position by ADP ascending.
+    const adpPosRankMap = {};
+    const byPosForAdp = {};
+    rankings.forEach(r => {
+      const adpVal = (adp[r.player.toLowerCase()] || {})[settings.activeAdp];
+      if (adpVal == null || !r.pos) return;
+      if (!byPosForAdp[r.pos]) byPosForAdp[r.pos] = [];
+      byPosForAdp[r.pos].push({ key: r.player.toLowerCase(), adp: adpVal });
+    });
+    Object.values(byPosForAdp).forEach(group => {
+      group.sort((a, b) => a.adp - b.adp);
+      group.forEach((entry, idx) => {
+        adpPosRankMap[entry.key] = idx + 1;
+      });
+    });
+
     return rankings
       .filter(r => !draftedSet.has(r.player.toLowerCase()))
       .map(r => {
         const adpData = adp[r.player.toLowerCase()] || {};
         const playerAdp = adpData[settings.activeAdp];
-        // valueVsPick: positive = good value (player available later than ADP suggests),
-        // negative = reach (drafting earlier than ADP suggests)
-        // Example: ADP 18.3, currentPick 6 -> 6 - 18.3 = -12.3 (reaching by 12 picks)
-        // Example: ADP 5, currentPick 20 -> 20 - 5 = +15 (steal — fell 15 picks past ADP)
-        const valueVsPick = playerAdp != null ? currentPick - playerAdp : null;
+        const adpPosRank = adpPosRankMap[r.player.toLowerCase()] || null;
 
-        // valueVsMyRank: positive = ADP says they're cheaper than I rank them (market undervalues)
-        // negative = ADP says they go earlier than I rank them (market overvalues)
-        // Example: My Rank 5, ADP 18 -> 18 - 5 = +13 (market undervalues — go get them)
-        // Example: My Rank 20, ADP 5 -> 5 - 20 = -15 (market overdrafts — fade)
-        const valueVsMyRank = (playerAdp != null && r.overallRank != null) ? playerAdp - r.overallRank : null;
+        // marketVsPick: ADP vs current pick (used for the Flag column)
+        // Positive = player is available later than ADP says (steal/value)
+        // Negative = drafting earlier than ADP says (reach)
+        const marketVsPick = playerAdp != null ? currentPick - playerAdp : null;
+
+        // myRankVsPick: where I have them ranked vs current pick
+        // Positive = good for me (drafting them later than I'd rank them — bonus value)
+        // Negative = reaching by my own ranking (I'd take them earlier than now)
+        // Example: My Rank 15, currentPick 6 -> 6 - 15 = -9 (reaching by 9 on my board)
+        // Example: My Rank 3, currentPick 25 -> 25 - 3 = +22 (huge fall)
+        const myRankVsPick = r.overallRank != null ? currentPick - r.overallRank : null;
+
+        // myRankVsAdp: how my rank compares to market ADP
+        // Positive = market values them lower than I do (potential value vs market)
+        // Negative = market drafts them earlier than my rank (market overvalues vs me)
+        // Example: My Rank 5, ADP 18 -> 18 - 5 = +13 (market sleeps on them)
+        // Example: My Rank 20, ADP 5 -> 5 - 20 = -15 (market overdrafts vs me)
+        const myRankVsAdp = (playerAdp != null && r.overallRank != null) ? playerAdp - r.overallRank : null;
 
         const dynRank = r.overallRank - (rosterNeedBump[r.pos] || 0) - (scarcityBump[r.pos] || 0);
 
+        // Flag uses marketVsPick (steal/value/reach vs ADP at current pick)
         let flag = null;
-        if (valueVsPick != null && playerAdp != null) {
-          if (valueVsPick >= settings.thresholds.steal) flag = 'STEAL';
-          else if (valueVsPick >= settings.thresholds.value) flag = 'VALUE';
-          else if (valueVsPick <= -settings.thresholds.reach) flag = 'REACH';
+        if (marketVsPick != null && playerAdp != null) {
+          if (marketVsPick >= settings.thresholds.steal) flag = 'STEAL';
+          else if (marketVsPick >= settings.thresholds.value) flag = 'VALUE';
+          else if (marketVsPick <= -settings.thresholds.reach) flag = 'REACH';
           else flag = 'FAIR';
-        }
-
-        // Personal flag from my-rank perspective
-        let myFlag = null;
-        if (valueVsMyRank != null) {
-          if (valueVsMyRank >= settings.thresholds.steal) myFlag = 'STEAL';
-          else if (valueVsMyRank >= settings.thresholds.value) myFlag = 'VALUE';
-          else if (valueVsMyRank <= -settings.thresholds.reach) myFlag = 'REACH';
-          else myFlag = 'FAIR';
         }
 
         let snipeRisk = null;
@@ -649,11 +703,12 @@ export default function App() {
         return {
           ...r,
           adp: playerAdp,
-          valueVsPick,
-          valueVsMyRank,
+          adpPosRank,
+          marketVsPick,
+          myRankVsPick,
+          myRankVsAdp,
           dynRank,
           flag,
-          myFlag,
           snipeRisk,
           isTarget,
           targetPriority: targetData?.priority || null,
@@ -723,7 +778,7 @@ export default function App() {
       if (scarcityBump[p.pos] > 0) reasons.push(`${p.pos} run`);
 
       let score = 0;
-      if (p.valueVsPick != null) score += p.valueVsPick;
+      if (p.marketVsPick != null) score += p.marketVsPick;
       if (p.isTarget) score += 10;
       score += (rosterNeedBump[p.pos] || 0) * 5;
       score += (scarcityBump[p.pos] || 0) * 3;
@@ -941,7 +996,7 @@ function DashboardView({
 }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [posFilter, setPosFilter] = useState('ALL'); // ALL | QB | RB | WR | TE | K | DST | FLEX
-  const [sortKey, setSortKey] = useState('dynRank'); // dynRank | overallRank | adp | tier | valueVsPick | valueVsMyRank | player | pos
+  const [sortKey, setSortKey] = useState('dynRank'); // dynRank | overallRank | adp | tier | myRankVsPick | myRankVsAdp | player | pos
   const [sortDir, setSortDir] = useState('asc'); // asc | desc
 
   const handleSort = (key) => {
@@ -950,7 +1005,7 @@ function DashboardView({
     } else {
       setSortKey(key);
       // Sensible defaults: ranks/ADP ascending (lower=better), values descending (higher=better)
-      setSortDir(['valueVsPick', 'valueVsMyRank'].includes(key) ? 'desc' : 'asc');
+      setSortDir(['myRankVsPick', 'myRankVsAdp'].includes(key) ? 'desc' : 'asc');
     }
   };
 
@@ -1176,13 +1231,13 @@ function DashboardView({
                     <SortableTh sortKey="dynRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Dyn</SortableTh>
                     <SortableTh sortKey="overallRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>My</SortableTh>
                     <SortableTh sortKey="player" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Player</SortableTh>
-                    <SortableTh sortKey="pos" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Pos</SortableTh>
+                    <SortableTh sortKey="posRank" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Pos</SortableTh>
                     <th className="text-left py-2 px-3 font-medium">Tm</th>
                     <th className="text-left py-2 px-3 font-medium">Bye</th>
                     <SortableTh sortKey="tier" currentKey={sortKey} dir={sortDir} onSort={handleSort}>Tier</SortableTh>
-                    <SortableTh sortKey="adp" currentKey={sortKey} dir={sortDir} onSort={handleSort}>ADP</SortableTh>
-                    <SortableTh sortKey="valueVsPick" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="ADP vs current pick">Pick Δ</SortableTh>
-                    <SortableTh sortKey="valueVsMyRank" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="ADP vs your ranking">My Δ</SortableTh>
+                    <SortableTh sortKey="adp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="Overall ADP (and position-ADP rank)">ADP</SortableTh>
+                    <SortableTh sortKey="myRankVsPick" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="My rank vs current pick. Positive = falling past where you'd rank them. Negative = reaching by your own board.">Pick Δ</SortableTh>
+                    <SortableTh sortKey="myRankVsAdp" currentKey={sortKey} dir={sortDir} onSort={handleSort} title="My rank vs market ADP. Positive = market sleeps on them. Negative = market overdrafts them.">My Δ</SortableTh>
                     <th className="text-left py-2 px-3 font-medium">Flag</th>
                     <th className="text-left py-2 px-3 font-medium">Snipe</th>
                     <th className="text-right py-2 px-3 font-medium">Action</th>
@@ -1205,24 +1260,42 @@ function DashboardView({
                           <span className="text-stone-100 font-semibold">{p.player}</span>
                         </div>
                       </td>
-                      <td className="py-2 px-3"><PosBadge pos={p.pos} size="sm" /></td>
+                      <td className="py-2 px-3">
+                        <div className="flex items-center gap-1.5">
+                          <PosBadge pos={p.pos} size="sm" />
+                          {p.posRank != null && (
+                            <span className="text-stone-400 text-[10px] font-mono">{p.posRank}</span>
+                          )}
+                        </div>
+                      </td>
                       <td className="py-2 px-3 text-stone-400">{p.team}</td>
                       <td className="py-2 px-3 text-stone-400">{p.bye || '—'}</td>
                       <td className="py-2 px-3 text-stone-400">{p.tier ? `T${p.tier}` : '—'}</td>
-                      <td className="py-2 px-3 text-stone-300">{p.adp != null ? p.adp.toFixed(1) : '—'}</td>
-                      <td className={`py-2 px-3 font-bold ${
-                        p.valueVsPick == null ? 'text-stone-600' :
-                        p.valueVsPick >= 6 ? 'text-emerald-400' :
-                        p.valueVsPick <= -6 ? 'text-rose-400' : 'text-stone-400'
-                      }`}>
-                        {p.valueVsPick == null ? '—' : (p.valueVsPick > 0 ? '+' : '') + p.valueVsPick.toFixed(0)}
+                      <td className="py-2 px-3">
+                        {p.adp != null ? (
+                          <div className="flex items-baseline gap-1.5">
+                            <span className="text-stone-300">{p.adp.toFixed(1)}</span>
+                            {p.adpPosRank != null && (
+                              <span className="text-stone-500 text-[10px] font-mono">{p.pos}{p.adpPosRank}</span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-stone-600">—</span>
+                        )}
                       </td>
                       <td className={`py-2 px-3 font-bold ${
-                        p.valueVsMyRank == null ? 'text-stone-600' :
-                        p.valueVsMyRank >= 6 ? 'text-emerald-400' :
-                        p.valueVsMyRank <= -6 ? 'text-rose-400' : 'text-stone-400'
+                        p.myRankVsPick == null ? 'text-stone-600' :
+                        p.myRankVsPick >= 6 ? 'text-emerald-400' :
+                        p.myRankVsPick <= -6 ? 'text-rose-400' : 'text-stone-400'
                       }`}>
-                        {p.valueVsMyRank == null ? '—' : (p.valueVsMyRank > 0 ? '+' : '') + p.valueVsMyRank.toFixed(0)}
+                        {p.myRankVsPick == null ? '—' : (p.myRankVsPick > 0 ? '+' : '') + p.myRankVsPick.toFixed(0)}
+                      </td>
+                      <td className={`py-2 px-3 font-bold ${
+                        p.myRankVsAdp == null ? 'text-stone-600' :
+                        p.myRankVsAdp >= 6 ? 'text-emerald-400' :
+                        p.myRankVsAdp <= -6 ? 'text-rose-400' : 'text-stone-400'
+                      }`}>
+                        {p.myRankVsAdp == null ? '—' : (p.myRankVsAdp > 0 ? '+' : '') + p.myRankVsAdp.toFixed(0)}
                       </td>
                       <td className="py-2 px-3">
                         {p.flag === 'STEAL' && <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">STEAL</span>}
@@ -1922,7 +1995,9 @@ function RankingsView({ rankingsSources, setRankingsSources, aggregateRankings, 
   const [search, setSearch] = useState('');
 
   const isAggregate = activeSource === 'aggregate';
-  const currentList = isAggregate ? aggregateRankings : (rankingsSources[activeSource] || []);
+  const currentListRaw = isAggregate ? aggregateRankings : (rankingsSources[activeSource] || []);
+  // Always show position ranks derived from overall rank order, regardless of what's stored
+  const currentList = useMemo(() => derivePositionRanks(currentListRaw), [currentListRaw]);
 
   const setCurrentList = (updater) => {
     if (isAggregate) return; // can't edit aggregate
